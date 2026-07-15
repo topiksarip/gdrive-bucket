@@ -1,0 +1,5 @@
+# Untuk mode REAL Google Drive (bukan mock). Install setelah setup Google Cloud.
+google-api-python-client
+google-auth-httplib2
+google-auth-oauthlib
+cryptography
