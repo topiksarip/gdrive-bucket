@@ -10,7 +10,7 @@ from app import db as db_mod
 from app.routes import router, COOKIE_NAME
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-DIST_DIR = BASE_DIR / "frontend" / "web-build"
+DIST_DIR = BASE_DIR / "frontend" / "flutter-web"
 
 OAUTH_CALLBACK = "/api/v1/accounts/oauth/callback"
 
@@ -32,19 +32,21 @@ def create_app():
         request.state.session_cookie = request.cookies.get(COOKIE_NAME)
         return await call_next(request)
 
-    # Serve built SPA: static assets from web-build/assets, with index.html fallback.
+    # Serve Flutter web: static assets, with index.html fallback for SPA routing.
     if DIST_DIR.exists():
-        # Mount static assets first — takes priority over catch-all routes
+        # Mount static asset directories first — priority over catch-all
         app.mount("/assets", StaticFiles(directory=DIST_DIR / "assets"), name="assets")
+        app.mount("/canvaskit", StaticFiles(directory=DIST_DIR / "canvaskit"), name="canvaskit")
+        app.mount("/icons", StaticFiles(directory=DIST_DIR / "icons"), name="icons")
 
-        # SPA catch-all: serve index.html for any non-API path (client-side routing)
+        # SPA catch-all: serve index.html for any non-API path (Flutter client-side routing)
         @app.get("/{full_path:path}")
         async def spa_index(request: Request, full_path: str):
-            # Let API, docs, and static assets through
+            # Let API, docs through
             if full_path.startswith("api/") or full_path.startswith("docs") \
                or full_path.startswith("openapi") or full_path == "health":
                 return JSONResponse({"detail": "not found"}, status_code=404)
-            # Check if it's a real file in dist (favicon, manifest, etc.)
+            # Check if it's a real file in flutter-web (flutter.js, main.dart.js, favicon.png, etc.)
             file_path = DIST_DIR / full_path
             if full_path and file_path.is_file():
                 return FileResponse(file_path)
