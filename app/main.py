@@ -50,8 +50,14 @@ def create_app():
             file_path = DIST_DIR / full_path
             if full_path and file_path.is_file():
                 return FileResponse(file_path)
-            # SPA fallback: serve index.html
-            return FileResponse(DIST_DIR / "index.html")
+            # SPA fallback: serve index.html with no-cache to prevent stale builds
+            return FileResponse(
+                DIST_DIR / "index.html",
+                headers={
+                    "Cache-Control": "no-cache, no-store, must-revalidate",
+                    "Pragma": "no-cache",
+                },
+            )
 
     return app
 
