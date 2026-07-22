@@ -10,7 +10,7 @@ from app import db as db_mod
 from app.routes import router, COOKIE_NAME
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-DIST_DIR = BASE_DIR / "frontend" / "dist"
+DIST_DIR = BASE_DIR / "frontend" / "web-build"
 
 OAUTH_CALLBACK = "/api/v1/accounts/oauth/callback"
 
@@ -32,16 +32,24 @@ def create_app():
         request.state.session_cookie = request.cookies.get(COOKIE_NAME)
         return await call_next(request)
 
+    # Serve built SPA: static assets from web-build/assets, with index.html fallback.
     if DIST_DIR.exists():
+        # Mount static assets first — takes priority over catch-all routes
         app.mount("/assets", StaticFiles(directory=DIST_DIR / "assets"), name="assets")
 
+        # SPA catch-all: serve index.html for any non-API path (client-side routing)
         @app.get("/{full_path:path}")
         async def spa_index(request: Request, full_path: str):
-            if full_path.startswith("api") or full_path.startswith("docs") \
+            # Let API, docs, and static assets through
+            if full_path.startswith("api/") or full_path.startswith("docs") \
                or full_path.startswith("openapi") or full_path == "health":
                 return JSONResponse({"detail": "not found"}, status_code=404)
-            index = DIST_DIR / "index.html"
-            return FileResponse(index)
+            # Check if it's a real file in dist (favicon, manifest, etc.)
+            file_path = DIST_DIR / full_path
+            if full_path and file_path.is_file():
+                return FileResponse(file_path)
+            # SPA fallback: serve index.html
+            return FileResponse(DIST_DIR / "index.html")
 
     return app
 
