@@ -9,6 +9,7 @@ from app.auth import (
     verify_password, verify_session_token, make_session_token,
     generate_api_key, hash_api_key, verify_api_key, hash_password,
     generate_access_key_id, generate_secret_access_key, hash_secret, verify_secret,
+    make_csrf_token, verify_csrf_token,
 )
 from app import drive as drive_mod
 from app import config as cfg
@@ -23,39 +24,62 @@ def get_db():
     yield from db_mod.get_db()
 
 
-def _valid_api_key(key: str, db: Session) -> bool:
+def _valid_api_key(key: str, db: Session):
+    """Validate API key. Returns (True, ApiKeyRecord) or (False, None)."""
     if not key:
-        return False
+        return False, None
     # legacy bk_ key
     rec = db.query(db_mod.ApiKey).filter(
         db_mod.ApiKey.key_hash == hash_api_key(key),
         db_mod.ApiKey.enabled == True,  # noqa: E712
     ).first()
     if rec:
-        return True
+        return True, rec
     # AWS-style secret access key (bksec_...) — agent kirim secret sebagai X-API-Key
     rec2 = db.query(db_mod.ApiKey).filter(
         db_mod.ApiKey.secret_hash == hash_secret(key),
         db_mod.ApiKey.enabled == True,  # noqa: E712
     ).first()
-    return rec2 is not None
+    return (True, rec2) if rec2 else (False, None)
 
 
-def _valid_session(request: Request, db: Session) -> bool:
+def _valid_session(request: Request, db: Session):
+    """Returns claims dict or None."""
     token = getattr(request.state, "session_cookie", None)
     if not token:
-        return False
-    email = verify_session_token(token)
-    if not email:
-        return False
-    return db.query(db_mod.User).filter(db_mod.User.email == email).first() is not None
+        return None
+    claims = verify_session_token(token)
+    if not claims:
+        return None
+    user = db.query(db_mod.User).filter(db_mod.User.email == claims["email"]).first()
+    if not user:
+        return None
+    return claims
 
 
 def require_api_key(request: Request, x_api_key: str = Header(None), db: Session = Depends(get_db)):
     # Terima X-API-Key ATAU session login (web UI).
-    if _valid_api_key(x_api_key, db):
-        return True
-    if _valid_session(request, db):
+    ok, rec = _valid_api_key(x_api_key, db)
+    if ok:
+        return rec  # return ApiKey record or True-like
+    claims = _valid_session(request, db)
+    if claims:
+        return True  # session-based auth
+    raise HTTPException(401, "Missing X-API-Key header or session")
+
+
+def _require_write_scope(request: Request, x_api_key: str = Header(None), db: Session = Depends(get_db)):
+    """Like require_api_key but enforces write scope for API keys."""
+    ok, rec = _valid_api_key(x_api_key, db)
+    if ok and rec is not None and rec is not True:
+        # API key auth — check scope
+        if hasattr(rec, 'scope') and rec.scope == "read":
+            raise HTTPException(403, "API key has read-only scope")
+        return rec
+    if ok:
+        return rec
+    claims = _valid_session(request, db)
+    if claims:
         return True
     raise HTTPException(401, "Missing X-API-Key header or session")
 
@@ -64,29 +88,58 @@ def require_web_login(request: Request, db: Session = Depends(get_db)):
     token = getattr(request.state, "session_cookie", None)
     if not token:
         raise HTTPException(401, "Not authenticated")
-    email = verify_session_token(token)
-    if not email:
+    claims = verify_session_token(token)
+    if not claims:
         raise HTTPException(401, "Bad session")
-    user = db.query(db_mod.User).filter(db_mod.User.email == email).first()
+    user = db.query(db_mod.User).filter(db_mod.User.email == claims["email"]).first()
     if not user:
         raise HTTPException(401, "Unknown user")
     return user
 
 
+def _require_csrf(request: Request, db: Session = Depends(get_db)):
+    """Enforce CSRF for state-changing session requests."""
+    token = getattr(request.state, "session_cookie", None)
+    if not token:
+        return  # no session = API key, no CSRF needed
+    claims = verify_session_token(token)
+    if not claims:
+        return
+    csrf_header = request.headers.get("X-CSRF-Token", "")
+    session_id = claims["email"]
+    if not csrf_header or not verify_csrf_token(session_id, csrf_header):
+        raise HTTPException(403, "CSRF token missing or invalid")
+
+
 # ---------- auth (web login) ----------
 class LoginIn(BaseModel):
-    email: str
+    login: str
     password: str
 
 
 @router.post("/api/v1/auth/login")
-def login(payload: LoginIn, response: Response, db: Session = Depends(get_db)):
-    user = db.query(db_mod.User).filter(db_mod.User.email == payload.email).first()
+def login(payload: LoginIn, request: Request, response: Response, db: Session = Depends(get_db)):
+    # Accept both username and email for login
+    user = db.query(db_mod.User).filter(
+        (db_mod.User.email == payload.login) | (db_mod.User.username == payload.login)
+    ).first()
     if not user or not verify_password(payload.password, user.password_hash):
         raise HTTPException(401, "Invalid credentials")
-    token = make_session_token(user.email)
-    response.set_cookie(COOKIE_NAME, token, httponly=True, samesite="lax", path="/")
-    return {"ok": True, "email": user.email, "is_admin": user.is_admin}
+    token = make_session_token(user.email, session_version=user.session_version)
+    csrf = make_csrf_token(user.email)
+    secure = cfg.COOKIE_SECURE
+    response.set_cookie(
+        COOKIE_NAME, token,
+        httponly=True, samesite="strict", path="/",
+        secure=secure, max_age=86400,
+    )
+    return {
+        "ok": True,
+        "email": user.email,
+        "username": user.username or user.email.split("@")[0],
+        "is_admin": user.is_admin,
+        "csrf_token": csrf,
+    }
 
 
 @router.post("/api/v1/auth/logout")
@@ -97,7 +150,7 @@ def logout(response: Response):
 
 @router.get("/api/v1/auth/me")
 def auth_me(user: db_mod.User = Depends(require_web_login)):
-    return {"ok": True, "email": user.email, "is_admin": user.is_admin}
+    return {"ok": True, "email": user.email, "username": user.username, "is_admin": user.is_admin}
 
 
 # ---------- API v1 (X-API-Key) ----------
@@ -126,11 +179,13 @@ def list_accounts(_: db_mod.ApiKey = Depends(require_api_key), db: Session = Dep
 
 @router.post("/api/v1/upload")
 async def upload(
+    request: Request,
     file: UploadFile = File(...),
     path: str = Form("/"),
-    _: db_mod.ApiKey = Depends(require_api_key),
+    _: db_mod.ApiKey = Depends(_require_write_scope),
     db: Session = Depends(get_db),
 ):
+    _require_csrf(request, db)
     data = await file.read()
     account = drive_mod.pick_account(db)
     if not account:
@@ -188,8 +243,6 @@ def drive_browse(
     account_id: int = None, folder_id: str = "root",
     _: db_mod.ApiKey = Depends(require_api_key), db: Session = Depends(get_db),
 ):
-    """Tampilkan file & folder ASLI dari Google Drive (live), bukan index lokal.
-    folder_id='root' untuk root Drive. Navigasi folder via frontend."""
     if account_id:
         acc = db.query(db_mod.Account).filter(db_mod.Account.id == account_id).first()
     else:
@@ -209,12 +262,14 @@ def drive_browse(
 
 @router.post("/api/v1/drive/upload")
 async def drive_upload(
+    request: Request,
     file: UploadFile = File(...),
     folder_id: str = Form("root"),
     account_id: int = Form(None),
-    _: db_mod.ApiKey = Depends(require_api_key), db: Session = Depends(get_db),
+    _: db_mod.ApiKey = Depends(_require_write_scope),
+    db: Session = Depends(get_db),
 ):
-    """Upload file langsung ke Google Drive asli (ke folder tertentu)."""
+    _require_csrf(request, db)
     if account_id:
         acc = db.query(db_mod.Account).filter(db_mod.Account.id == account_id).first()
     else:
@@ -228,7 +283,6 @@ async def drive_upload(
     drv = drive_mod.RealDriveAccount(acc)
     parent = "root" if not folder_id or folder_id == "root" else folder_id
     fid, size = drv.upload_to_folder(file.filename or "untitled", data, parent)
-    # update quota usage
     try:
         drive_mod.refresh_account_quota(acc, db)
     except Exception:
@@ -238,11 +292,13 @@ async def drive_upload(
 
 @router.delete("/api/v1/drive/files/{drive_file_id}")
 def drive_delete(
+    request: Request,
     drive_file_id: str,
     account_id: int = None,
-    _: db_mod.ApiKey = Depends(require_api_key), db: Session = Depends(get_db),
+    _: db_mod.ApiKey = Depends(_require_write_scope),
+    db: Session = Depends(get_db),
 ):
-    """Hapus file/folder ASLI di Google Drive."""
+    _require_csrf(request, db)
     if account_id:
         acc = db.query(db_mod.Account).filter(db_mod.Account.id == account_id).first()
     else:
@@ -267,8 +323,6 @@ def drive_download(
     account_id: int = None,
     _: db_mod.ApiKey = Depends(require_api_key), db: Session = Depends(get_db),
 ):
-    """Kembalikan URL download LANGSUNG ke Google Drive (alt=media+token).
-    Browser fetch langsung ke Google -> trafik TIDAK lewat VPS."""
     if account_id:
         acc = db.query(db_mod.Account).filter(db_mod.Account.id == account_id).first()
     else:
@@ -283,7 +337,8 @@ def drive_download(
         url, method = drv.direct_download_url(drive_file_id)
     except RuntimeError as e:
         raise HTTPException(400, str(e))
-    return {"url": url, "method": method, "token": drv._get_creds().token if method == "bearer" else ""}
+    # SECURITY: never return the bearer token to the client
+    return {"url": url, "method": method}
 
 
 @router.get("/api/v1/drive/files/{drive_file_id}/link")
@@ -292,7 +347,6 @@ def drive_link(
     account_id: int = None,
     _: db_mod.ApiKey = Depends(require_api_key), db: Session = Depends(get_db),
 ):
-    """Alias untuk direct download URL (frontend pakai ini)."""
     return drive_download(drive_file_id, account_id, db=db)
 
 
@@ -311,11 +365,13 @@ def _pick_real_account(db: Session, account_id: int = None):
 
 @router.post("/api/v1/drive/folders")
 def drive_create_folder(
+    request: Request,
     payload: dict,
     account_id: int = None,
-    _: db_mod.ApiKey = Depends(require_api_key), db: Session = Depends(get_db),
+    _: db_mod.ApiKey = Depends(_require_write_scope),
+    db: Session = Depends(get_db),
 ):
-    """Buat folder baru di Google Drive (di bawah folder_id tertentu)."""
+    _require_csrf(request, db)
     name = (payload.get("name") or "").strip()
     folder_id = payload.get("folder_id", "root") or "root"
     if not name:
@@ -332,11 +388,9 @@ def drive_metadata(
     account_id: int = None,
     _: db_mod.ApiKey = Depends(require_api_key), db: Session = Depends(get_db),
 ):
-    """Metadata lengkap file/folder dari Google Drive + tag/note lokal."""
     acc = _pick_real_account(db, account_id)
     drv = drive_mod.RealDriveAccount(acc)
     meta = drv.get_metadata(drive_file_id)
-    # gabungkan tag/note lokal
     dm = db.query(db_mod.DriveMeta).filter(
         db_mod.DriveMeta.drive_file_id == drive_file_id,
         db_mod.DriveMeta.account_id == acc.id,
@@ -348,11 +402,13 @@ def drive_metadata(
 
 @router.put("/api/v1/drive/files/{drive_file_id}/meta")
 def drive_set_meta(
+    request: Request,
     drive_file_id: str, payload: dict,
     account_id: int = None,
-    _: db_mod.ApiKey = Depends(require_api_key), db: Session = Depends(get_db),
+    _: db_mod.ApiKey = Depends(_require_write_scope),
+    db: Session = Depends(get_db),
 ):
-    """Set object tag + note lokal untuk file/folder."""
+    _require_csrf(request, db)
     acc = _pick_real_account(db, account_id)
     tag = payload.get("tag", "")
     note = payload.get("note", "")
@@ -375,7 +431,6 @@ def drive_path(
     account_id: int = None,
     _: db_mod.ApiKey = Depends(require_api_key), db: Session = Depends(get_db),
 ):
-    """Path lengkap file/folder di Drive (dari root)."""
     acc = _pick_real_account(db, account_id)
     drv = drive_mod.RealDriveAccount(acc)
     return {"path": drv.get_full_path(drive_file_id)}
@@ -387,7 +442,6 @@ def drive_permissions(
     account_id: int = None,
     _: db_mod.ApiKey = Depends(require_api_key), db: Session = Depends(get_db),
 ):
-    """Daftar permission file/folder."""
     acc = _pick_real_account(db, account_id)
     drv = drive_mod.RealDriveAccount(acc)
     perms = drv.get_permissions(drive_file_id)
@@ -397,11 +451,13 @@ def drive_permissions(
 
 @router.post("/api/v1/drive/files/{drive_file_id}/permission")
 def drive_set_permission(
+    request: Request,
     drive_file_id: str, payload: dict,
     account_id: int = None,
-    _: db_mod.ApiKey = Depends(require_api_key), db: Session = Depends(get_db),
+    _: db_mod.ApiKey = Depends(_require_write_scope),
+    db: Session = Depends(get_db),
 ):
-    """Set public (anyone reader) atau private (hapus permission anyone)."""
+    _require_csrf(request, db)
     public = bool(payload.get("public", False))
     acc = _pick_real_account(db, account_id)
     drv = drive_mod.RealDriveAccount(acc)
@@ -415,7 +471,6 @@ def drive_links(
     account_id: int = None,
     _: db_mod.ApiKey = Depends(require_api_key), db: Session = Depends(get_db),
 ):
-    """Link download (webContentLink) + preview (webViewLink) langsung dari Google."""
     acc = _pick_real_account(db, account_id)
     drv = drive_mod.RealDriveAccount(acc)
     return drv.get_links(drive_file_id)
@@ -423,12 +478,13 @@ def drive_links(
 
 @router.post("/api/v1/drive/upload-url")
 def drive_upload_url(
+    request: Request,
     payload: dict,
     account_id: int = None,
-    _: db_mod.ApiKey = Depends(require_api_key), db: Session = Depends(get_db),
+    _: db_mod.ApiKey = Depends(_require_write_scope),
+    db: Session = Depends(get_db),
 ):
-    """Mulai resumable upload session ke Google. Kembalikan URL session.
-    Frontend lalu PUT file langsung ke Google -> trafik upload TIDAK lewat VPS."""
+    _require_csrf(request, db)
     filename = payload.get("filename", "untitled")
     folder_id = payload.get("folder_id", "root")
     mime = payload.get("mime", "application/octet-stream")
@@ -449,7 +505,6 @@ def drive_upload_url(
     return {"upload_url": session_uri}
 
 
-
 @router.get("/api/v1/files/{file_id}/download")
 def download(file_id: int, _: db_mod.ApiKey = Depends(require_api_key), db: Session = Depends(get_db)):
     fm = db.query(db_mod.FileMeta).filter(db_mod.FileMeta.id == file_id).first()
@@ -465,7 +520,13 @@ def download(file_id: int, _: db_mod.ApiKey = Depends(require_api_key), db: Sess
 
 
 @router.patch("/api/v1/files/{file_id}")
-def rename_move(file_id: int, payload: dict, _: db_mod.ApiKey = Depends(require_api_key), db: Session = Depends(get_db)):
+def rename_move(
+    request: Request,
+    file_id: int, payload: dict,
+    _: db_mod.ApiKey = Depends(_require_write_scope),
+    db: Session = Depends(get_db),
+):
+    _require_csrf(request, db)
     fm = db.query(db_mod.FileMeta).filter(db_mod.FileMeta.id == file_id).first()
     if not fm:
         raise HTTPException(404, "File not found")
@@ -478,7 +539,13 @@ def rename_move(file_id: int, payload: dict, _: db_mod.ApiKey = Depends(require_
 
 
 @router.delete("/api/v1/files/{file_id}")
-def delete(file_id: int, _: db_mod.ApiKey = Depends(require_api_key), db: Session = Depends(get_db)):
+def delete(
+    request: Request,
+    file_id: int,
+    _: db_mod.ApiKey = Depends(_require_write_scope),
+    db: Session = Depends(get_db),
+):
+    _require_csrf(request, db)
     fm = db.query(db_mod.FileMeta).filter(db_mod.FileMeta.id == file_id).first()
     if not fm:
         raise HTTPException(404, "File not found")
@@ -492,7 +559,12 @@ def delete(file_id: int, _: db_mod.ApiKey = Depends(require_api_key), db: Sessio
 
 # ---------- Access Keys (gaya AWS S3) ----------
 @router.post("/api/v1/access-keys")
-def create_access_key(user: db_mod.User = Depends(require_web_login), db: Session = Depends(get_db)):
+def create_access_key(
+    request: Request,
+    user: db_mod.User = Depends(require_web_login),
+    db: Session = Depends(get_db),
+):
+    _require_csrf(request, db)
     ak = generate_access_key_id()
     secret = generate_secret_access_key()
     db.add(db_mod.ApiKey(
@@ -518,7 +590,13 @@ def list_access_keys(user: db_mod.User = Depends(require_web_login), db: Session
 
 
 @router.delete("/api/v1/access-keys/{key_id}")
-def revoke_access_key(key_id: int, user: db_mod.User = Depends(require_web_login), db: Session = Depends(get_db)):
+def revoke_access_key(
+    request: Request,
+    key_id: int,
+    user: db_mod.User = Depends(require_web_login),
+    db: Session = Depends(get_db),
+):
+    _require_csrf(request, db)
     k = db.query(db_mod.ApiKey).filter(db_mod.ApiKey.id == key_id).first()
     if not k or not k.access_key_id:
         raise HTTPException(404, "Access key tidak ditemukan")
@@ -528,25 +606,37 @@ def revoke_access_key(key_id: int, user: db_mod.User = Depends(require_web_login
 
 
 @router.post("/api/v1/access-keys/{key_id}/rotate")
-def rotate_access_key(key_id: int, user: db_mod.User = Depends(require_web_login), db: Session = Depends(get_db)):
+def rotate_access_key(
+    request: Request,
+    key_id: int,
+    user: db_mod.User = Depends(require_web_login),
+    db: Session = Depends(get_db),
+):
+    _require_csrf(request, db)
     k = db.query(db_mod.ApiKey).filter(db_mod.ApiKey.id == key_id).first()
     if not k or not k.access_key_id:
         raise HTTPException(404, "Access key tidak ditemukan")
     secret = generate_secret_access_key()
     k.secret_hash = hash_secret(secret)
-    k.enabled = True  # pastikan aktif setelah rotate
+    k.enabled = True
     db.commit()
-    # secret hanya tampil sekali
     return {"access_key_id": k.access_key_id, "secret_access_key": secret}
 
 
-# ---------- Domain setting (admin) ----------\n@router.get("/api/v1/settings/domain")
+# ---------- Domain setting (admin) ----------
+@router.get("/api/v1/settings/domain")
 def get_domain(user: db_mod.User = Depends(require_web_login), db: Session = Depends(get_db)):
     return {"domain": db_mod.get_setting(db, "BUCKET_DOMAIN", "")}
 
 
 @router.put("/api/v1/settings/domain")
-def set_domain(payload: dict, user: db_mod.User = Depends(require_web_login), db: Session = Depends(get_db)):
+def set_domain(
+    request: Request,
+    payload: dict,
+    user: db_mod.User = Depends(require_web_login),
+    db: Session = Depends(get_db),
+):
+    _require_csrf(request, db)
     dom = (payload.get("domain") or "").strip().rstrip("/")
     db_mod.set_setting(db, "BUCKET_DOMAIN", dom)
     return {"domain": dom}
@@ -572,6 +662,7 @@ def _acct_out(a):
 
 # ---------- Public registration ----------
 class RegisterIn(BaseModel):
+    username: str = ""
     email: str
     password: str
 
@@ -579,13 +670,16 @@ class RegisterIn(BaseModel):
 @router.post("/api/v1/auth/register")
 def public_register(payload: RegisterIn, db: Session = Depends(get_db)):
     import re
-    if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", payload.email):
+    if not cfg.ALLOW_PUBLIC_REGISTRATION:
+        raise HTTPException(403, "Public registration is disabled")
+    if not re.match(r"^[^\s@]+@[^\s@]+\.[^\s@]+$", payload.email):
         raise HTTPException(400, "Email tidak valid")
     if len(payload.password) < 6:
         raise HTTPException(400, "Password minimal 6 karakter")
     if db.query(db_mod.User).filter(db_mod.User.email == payload.email).first():
         raise HTTPException(409, "Email sudah terdaftar")
     db.add(db_mod.User(
+        username=payload.username or payload.email.split("@")[0],
         email=payload.email,
         password_hash=hash_password(payload.password),
         is_admin=False,
@@ -601,7 +695,7 @@ class AccountIn(BaseModel):
     mock: bool = False
     quota_limit: int = 0
     client_id: str = ""
-    client_secret: str = ""  # plain di request, disimpan terenkripsi
+    client_secret: str = ""
 
 
 @router.get("/api/v1/admin/accounts")
@@ -610,7 +704,13 @@ def admin_list_accounts(_: db_mod.User = Depends(require_admin), db: Session = D
 
 
 @router.post("/api/v1/admin/accounts")
-def admin_create_account(payload: AccountIn, _: db_mod.User = Depends(require_admin), db: Session = Depends(get_db)):
+def admin_create_account(
+    request: Request,
+    payload: AccountIn,
+    _: db_mod.User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    _require_csrf(request, db)
     if db.query(db_mod.Account).filter(db_mod.Account.email == payload.email).first():
         raise HTTPException(409, "Email sudah terdaftar")
     acct = db_mod.Account(
@@ -629,7 +729,13 @@ def admin_create_account(payload: AccountIn, _: db_mod.User = Depends(require_ad
 
 
 @router.patch("/api/v1/admin/accounts/{account_id}")
-def admin_update_account(account_id: int, payload: dict, _: db_mod.User = Depends(require_admin), db: Session = Depends(get_db)):
+def admin_update_account(
+    request: Request,
+    account_id: int, payload: dict,
+    _: db_mod.User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    _require_csrf(request, db)
     a = db.query(db_mod.Account).filter(db_mod.Account.id == account_id).first()
     if not a:
         raise HTTPException(404, "Account not found")
@@ -643,7 +749,13 @@ def admin_update_account(account_id: int, payload: dict, _: db_mod.User = Depend
 
 
 @router.delete("/api/v1/admin/accounts/{account_id}")
-def admin_delete_account(account_id: int, _: db_mod.User = Depends(require_admin), db: Session = Depends(get_db)):
+def admin_delete_account(
+    request: Request,
+    account_id: int,
+    _: db_mod.User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    _require_csrf(request, db)
     a = db.query(db_mod.Account).filter(db_mod.Account.id == account_id).first()
     if not a:
         raise HTTPException(404, "Account not found")
@@ -659,7 +771,7 @@ def admin_me(user: db_mod.User = Depends(require_admin)):
     return {"email": user.email, "is_admin": user.is_admin}
 
 
-# ---------- Super Admin: global settings (hanya redirect uri + mode) ----------
+# ---------- Super Admin: global settings ----------
 @router.get("/api/v1/admin/settings")
 def admin_get_settings(_: db_mod.User = Depends(require_admin), db: Session = Depends(get_db)):
     return {
@@ -669,7 +781,13 @@ def admin_get_settings(_: db_mod.User = Depends(require_admin), db: Session = De
 
 
 @router.post("/api/v1/admin/settings")
-def admin_save_settings(payload: dict, _: db_mod.User = Depends(require_admin), db: Session = Depends(get_db)):
+def admin_save_settings(
+    request: Request,
+    payload: dict,
+    _: db_mod.User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    _require_csrf(request, db)
     for k in ("OAUTH_REDIRECT_URI", "DRIVE_MOCK"):
         if k in payload:
             db_mod.set_setting(db, k, str(payload[k]))
@@ -716,7 +834,7 @@ def admin_oauth_callback(code: str = "", state: str = "", error: str = "", db: S
         import requests
         print(f"[oauth-cb] account={a.id} exchanging code (len={len(code)})...")
         last_body = ""
-        for attempt in range(2):  # retry 1x toleransi jeda/rate-limit
+        for attempt in range(2):
             r = requests.post("https://oauth2.googleapis.com/token", data={
                 "code": code,
                 "client_id": a.client_id,
@@ -729,16 +847,14 @@ def admin_oauth_callback(code: str = "", state: str = "", error: str = "", db: S
             if r.status_code == 200:
                 break
             if "invalid_grant" in r.text and attempt == 0:
-                # code mungkin belum siap di sisi Google; tunggu sebentar lalu coba lagi
                 import time
                 time.sleep(2)
         if r.status_code != 200:
-            # kembalikan JSON 400 (bukan 502) supaya error kelihatan di browser
             return JSONResponse(
                 {"error": "token_exchange_failed", "google_status": r.status_code, "google_detail": r.text[:500]},
                 status_code=400,
             )
-        a.token_enc = encrypt(json.dumps(r.json()))  # simpan full token (access+refresh) terenkripsi
+        a.token_enc = encrypt(json.dumps(r.json()))
         a.connected = True
         db.commit()
         print(f"[oauth-cb] account={a.id} connected.")
@@ -756,9 +872,15 @@ def cookie_name():
     return {"cookie": COOKIE_NAME}
 
 
-# ---------- Auto-detect kapasitas akun (mock=limit terkonfigurasi, real=Google about.get) ----------
+# ---------- Auto-detect kapasitas akun ----------
 @router.post("/api/v1/admin/accounts/{account_id}/refresh-capacity")
-def admin_refresh_capacity(account_id: int, _: db_mod.User = Depends(require_admin), db: Session = Depends(get_db)):
+def admin_refresh_capacity(
+    request: Request,
+    account_id: int,
+    _: db_mod.User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    _require_csrf(request, db)
     from app import drive as drive_mod
     a = db.query(db_mod.Account).filter(db_mod.Account.id == account_id).first()
     if not a:
@@ -768,4 +890,3 @@ def admin_refresh_capacity(account_id: int, _: db_mod.User = Depends(require_adm
     except Exception as e:
         raise HTTPException(502, "Gagal auto-detect kapasitas: " + str(e)[:300])
     return {"ok": True, "account": _acct_out(a), "quota_limit": limit, "quota_used": used}
-

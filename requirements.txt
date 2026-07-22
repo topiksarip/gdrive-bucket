@@ -5,3 +5,4 @@ pydantic
 python-multipart
 cryptography
 requests
+argon2-cffi
