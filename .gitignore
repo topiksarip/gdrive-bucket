@@ -36,3 +36,4 @@ Thumbs.db
 .idea/
 .vscode/
 frontend/web-build/
+frontend/flutter-web/
