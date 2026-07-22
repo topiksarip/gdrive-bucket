@@ -44,3 +44,6 @@ def create_app():
             return FileResponse(index)
 
     return app
+
+
+app = create_app()
